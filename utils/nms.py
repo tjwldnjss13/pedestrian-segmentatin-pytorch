@@ -11,14 +11,18 @@ class NMS(nn.Module):
 
     def forward(self, bounding_box, cls_score):
         """
-        :param bounding_box: Tensor, [num batches, (y1, x1, y2, x2)]
-        :param cls_score: Tensor, [num batches]
-        :return:
+        :param bounding_box: Tensor, [num rois, (y1, x1, y2, x2)]
+        :param cls_score: Tensor, [num rois]
+        :return bbox_keep: Tensor, [num rois after nms, (y1, x1, y2, x2)]
         """
-        keep = [True for _ in range(len(bounding_box))]
+        print('NMS started.')
 
-        score, idx = torch.sort(cls_score, descending=True)
-        bbox = bounding_box[idx]
+        bbox = bounding_box[0]
+        score = cls_score[0]
+
+        keep = [True for _ in range(len(bbox))]
+        score, idx = torch.sort(score, descending=True)
+        bbox = bbox[idx]
 
         for i in range(len(bbox) - 1):
             ious = calculate_ious(bbox[i+1:], bbox[i])
@@ -26,7 +30,11 @@ class NMS(nn.Module):
                 if iou > self.iou_threshold:
                     keep[i+j+1] = False
 
-        return bbox[keep]
+        bbox_keep = bbox[keep]
+
+        print('NMS ended.')
+
+        return bbox_keep
 
 
 

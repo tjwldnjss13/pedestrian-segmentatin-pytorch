@@ -119,12 +119,12 @@ def test():
     img = torch.Tensor([1, 2, 3, 4, 5]).repeat(5, 1).repeat(3, 1, 1)
     rois = torch.Tensor([1, 1, 3, 4]).repeat(2, 1)
 
-    print('img.shape :', img.shape)
-    print('rois.shape :', rois.shape)
+    # print('img.shape :', img.shape)
+    # print('rois.shape :', rois.shape)
 
     aligned_feature = roi_align(img, rois)
-    for f in aligned_feature:
-        print(f)
+    # for f in aligned_feature:
+    #     print(f)
 
 
 

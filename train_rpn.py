@@ -21,26 +21,30 @@ def get_dataset():
     root_train = os.path.join(root, 'Train')
     root_val = os.path.join(root, 'Validation')
 
-    transform_img = transforms.Compose([transforms.Resize((448, 448)), transforms.ToTensor()])
-    transform_mask = transforms.Compose(
-        [transforms.Resize((448, 448), interpolation=Image.NEAREST), transforms.ToTensor()])
+    transform_img = transforms.Compose([transforms.Resize((448, 448)),
+                                        transforms.ToTensor(),
+                                        transforms.Normalize([.485, .456, .406], [.229, .224, .225])])
+    transform_mask = transforms.Compose([transforms.Resize((448, 448), interpolation=Image.NEAREST),
+                                         transforms.ToTensor()])
 
-    aug_shift = shift_with_mask
-    aug_flip_shift = [horizontal_flip_with_mask, shift_with_mask]
-    aug_rot = rotate2d_with_mask
-    aug_flip_rot = [horizontal_flip_with_mask, rotate2d_with_mask]
-    aug_shift_rot = [shift_with_mask, rotate2d_with_mask]
-    aug_flip_shift_rot = [horizontal_flip_with_mask, shift_with_mask, rotate2d_with_mask]
+    aug_flip = horizontal_flip_augmentation
+    aug_shift = shift_augmentation
+    aug_flip_shift = [horizontal_flip_augmentation, shift_augmentation]
+    aug_rot = rotate2d_augmentation
+    aug_flip_rot = [horizontal_flip_augmentation, rotate2d_augmentation]
+    aug_shift_rot = [shift_augmentation, rotate2d_augmentation]
+    aug_flip_shift_rot = [horizontal_flip_augmentation, shift_augmentation, rotate2d_augmentation]
 
     dset_og = PennFudanDataset(root_train, transform_img, transform_mask)
+    dset_flip = PennFudanDataset(root_train, transform_img, transform_mask, aug_flip)
     dset_shift = [PennFudanDataset(root_train, transform_img, transform_mask, aug_shift) for _ in range(10)]
     dset_flip_shift = [PennFudanDataset(root_train, transform_img, transform_mask, aug_flip_shift) for _ in range(10)]
-    dset_rot = [PennFudanDataset(root_train, transform_img, transform_mask, aug_rot) for _ in range(10)]
-    dset_flip_rot = [PennFudanDataset(root_train, transform_img, transform_mask, aug_flip_rot) for _ in range(10)]
-    dset_shift_rot = [PennFudanDataset(root_train, transform_img, transform_mask, aug_shift_rot) for _ in range(10)]
-    dset_flip_shift_rot = [PennFudanDataset(root_train, transform_img, transform_mask, aug_flip_shift_rot) for _ in range(10)]
+    dset_rot = [PennFudanDataset(root_train, transform_img, transform_mask, aug_rot) for _ in range(30)]
+    dset_flip_rot = [PennFudanDataset(root_train, transform_img, transform_mask, aug_flip_rot) for _ in range(30)]
+    dset_shift_rot = [PennFudanDataset(root_train, transform_img, transform_mask, aug_shift_rot) for _ in range(300)]
+    dset_flip_shift_rot = [PennFudanDataset(root_train, transform_img, transform_mask, aug_flip_shift_rot) for _ in range(300)]
 
-    dset_train = ConcatDataset([*dset_shift, *dset_flip_shift, *dset_rot, *dset_flip_rot, *dset_shift_rot, *dset_flip_shift_rot])
+    dset_train = ConcatDataset([dset_og, dset_flip, *dset_shift, *dset_flip_shift, *dset_rot, *dset_flip_rot, *dset_shift_rot, *dset_flip_shift_rot])
     dset_val = PennFudanDataset(root_val, transform_img, transform_mask)
 
     return dset_train, dset_val, custom_collate_fn
@@ -49,11 +53,11 @@ def get_dataset():
 def adjust_learning_rate(optimizer, epoch):
     for p in optimizer.param_groups:
         if epoch < 20:
-            p['lr'] = .0001
+            pass
         elif epoch < 40:
-            p['lr'] = .00001
+            p['lr'] *= .1
         else:
-            p['lr'] = .000001
+            p['lr'] *= .1
 
 
 if __name__ == '__main__':
@@ -80,13 +84,15 @@ if __name__ == '__main__':
     train_loader = DataLoader(train_dset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 
-    model = RPN(256, 28).to(device)
-    state_dict_pth = './pretrain/22epoch_0.0004651loss.pth'
+    model = RPN().to(device)
+    model.train_rpn_only = True
+    state_dict_pth = None
+    # state_dict_pth = './pretrain/22epoch_0.0004651loss.pth'
     if state_dict_pth is not None:
         model.load_state_dict(torch.load(state_dict_pth))
 
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    loss_func = RPNLoss(1, 28 ** 2, 1)
+    loss_func = RPNLoss()
 
     train_loss_list = []
     val_loss_list = []
@@ -99,7 +105,7 @@ if __name__ == '__main__':
         N_data = 0
 
         adjust_learning_rate(optimizer, e + 1)
-        for i, (img, mask, ann) in enumerate(train_loader):
+        for i, (img, _, _, ann) in enumerate(train_loader):
             # t_s = time.time()
             # print(f'train start-------------------------------------------------')
             N_data += 1
@@ -111,8 +117,9 @@ if __name__ == '__main__':
             y_bbox = ann[0]['bounding_boxes'].to(device)
 
             optimizer.zero_grad()
-            reg, cls, anc_box, anc_label, gt_per_anc = model(x, y_bbox)
-            loss = loss_func(reg, cls, anc_box, anc_label, gt_per_anc)
+            # reg, cls, anc_box, anc_label, gt_per_anc, _ = model(x, y_bbox)
+            reg, cls, anc_idx, anc_cls_label, gt_per_anc_idx = model(x, y_bbox)
+            loss = loss_func(reg, cls, y_bbox, model.anc_boxes[anc_idx], anc_cls_label, gt_per_anc_idx)
             loss.backward()
             optimizer.step()
 
@@ -129,17 +136,19 @@ if __name__ == '__main__':
         train_loss_list.append(train_losses)
 
         val_losses = 0
-        N_dat = 0
-        for i, (img, mask, ann) in enumerate(val_loader):
-            N_data += 1
+        N_data = 0
+        with torch.no_grad():
+            for i, (img, _, _, ann) in enumerate(val_loader):
+                N_data += 1
 
-            x = img[0].unsqueeze(0).to(device)
-            y_bbox = ann[0]['bounding_boxes'].to(device)
+                x = img[0].unsqueeze(0).to(device)
+                y_bbox = ann[0]['bounding_boxes'].to(device)
 
-            reg, cls, anc_box, anc_label, gt_per_anc = model(x, y_bbox)
-            loss = loss_func(reg, cls, anc_box, anc_label, gt_per_anc)
+                reg, cls, anc_idx, anc_cls_label, gt_per_anc_idx = model(x, y_bbox)
+                loss = loss_func(reg, cls, y_bbox, model.anc_boxes[anc_idx], anc_cls_label, gt_per_anc_idx)
+                print(f'     <loss> {loss.cpu().item()}')
 
-            val_losses += loss.cpu().item()
+                val_losses += loss.cpu().item()
 
         val_losses /= N_data
 

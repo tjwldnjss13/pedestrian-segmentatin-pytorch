@@ -5,6 +5,7 @@ import torch.nn as nn
 
 from model.backbone import *
 from utils.pytorch_util import *
+from loss import *
 
 # For test
 import cv2 as cv
@@ -14,29 +15,22 @@ from PIL import Image
 
 
 class RPN(nn.Module):
-    def __init__(self, in_channel, feature_size):
+    def __init__(self, in_channels, device=torch.device('cuda:0')):
         super(RPN, self).__init__()
-        if isinstance(feature_size, int):
-            self.size = (feature_size, feature_size)
-        else:
-            self.size = feature_size
+        self.device = device
+        self.train_rpn_only = False
 
-        self.backbone = Backbone()
-        # self.anchors = np.array([[1.73145, 1.3221], [4.00944, 3.19275], [8.09892, 5.05587], [4.84053, 9.47112], [10.0071, 11.2364]])
-        self.anchors = self._make_anchor()
-        self.anc_boxes = self._make_anchor_box().cuda()
+        # self.backbone = Backbone()
+        self.anc_boxes, self.valid_idx = self._make_anchor_box()
+        self.roi_cls_threshold = .9
 
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channel, in_channel, 3, 1, 1),
-            nn.BatchNorm2d(in_channel),
-            nn.ReLU(True)
-        )
+        self.conv = Conv(in_channels, in_channels, 3, 1, 1)
         self.conv_reg = nn.Sequential(
-            nn.Conv2d(in_channel, 4 * len(self.anchors), 1),
+            nn.Conv2d(in_channels, 4 * 9, 1),
             nn.Sigmoid()
         )
         self.conv_cls = nn.Sequential(
-            nn.Conv2d(in_channel, len(self.anchors), 1),
+            nn.Conv2d(in_channels, 9, 1),
             nn.Sigmoid()
         )
 
@@ -55,7 +49,7 @@ class RPN(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def _make_anchor(self):
-        scale = [4., 8., 16.]
+        scale = [64, 128, 256]
         ratio = [.5, 1, 2]
 
         anc = np.zeros((len(scale) * len(ratio), 2))
@@ -67,36 +61,39 @@ class RPN(nn.Module):
                 anc[i] = [h, w]
                 i += 1
 
+        anc /= 448
+
         return anc
 
     def _make_anchor_center(self):
-        y = torch.linspace(0, self.size[0] - 1, self.size[0]).reshape(self.size[0], 1).repeat(1, self.size[1]).reshape(self.size) + .5
-        x = torch.linspace(0, self.size[0] - 1, self.size[0]).repeat(self.size[0], 1) + .5
+        y = torch.linspace(0, 27, 28).view(28, 1).repeat(1, 28).view(28, 28) + .5
+        x = torch.linspace(0, 27, 28).repeat(28, 1) + .5
 
         cen = torch.cat([y.unsqueeze(-1), x.unsqueeze(-1)], dim=-1)
+        cen /= 28
 
         return cen
 
     def _make_anchor_box(self):
+        ancs = self._make_anchor()
         anc_centers = self._make_anchor_center()
-        anc_boxes = torch.zeros(*self.size, 4 * len(self.anchors))
-        for i in range(len(self.anchors)):
+        anc_boxes = torch.zeros(28, 28, 4 * 9)
+        for i in range(9):
             anc_boxes[..., i * 4] = anc_centers[..., 0]
             anc_boxes[..., i * 4 + 1] = anc_centers[..., 1]
-            anc_boxes[..., i * 4 + 2] = self.anchors[i, 0]
-            anc_boxes[..., i * 4 + 3] = self.anchors[i, 1]
+            anc_boxes[..., i * 4 + 2] = ancs[i, 0]
+            anc_boxes[..., i * 4 + 3] = ancs[i, 1]
 
-        anc_boxes = convert_box_from_yxhw_to_yxyx(anc_boxes.reshape(-1, 4))
-        # valid_idx = (anc_boxes[..., 0] > 0) & (anc_boxes[..., 1] > 0) & (anc_boxes[..., 2] < self.size[0]) & (anc_boxes[..., 3] < self.size[1])
-        # anc_boxes = anc_boxes[valid_idx]
+        anc_boxes = convert_box_from_yxhw_to_yxyx(anc_boxes.view(-1, 4))
+        valid_idx = (anc_boxes[..., 0] > 0) & (anc_boxes[..., 1] > 0) & (anc_boxes[..., 2] < 28) & (anc_boxes[..., 3] < 28)
+        anc_boxes = anc_boxes[valid_idx]
 
-        return anc_boxes
+        return anc_boxes, valid_idx
 
     def _calculate_ious_anchor_ground_truth(self, ground_truth):
         # t_s = time.time()
         # print(f'rpn._calculate_ious_anchor_ground_truth() start')
 
-        N_anc = len(self.anc_boxes)
         N_gt = len(ground_truth)
 
         #######################################################################################
@@ -109,100 +106,54 @@ class RPN(nn.Module):
 
         for i in range(N_gt):
             if i == 0:
-                ious_anc_gt = calculate_ious(self.anc_boxes, ground_truth[i]).unsqueeze(-1)
+                # ious_anc_gt = calculate_ious(self.anc_boxes, ground_truth[i]).unsqueeze(-1)
+                ious_anc_gt = calculate_ious(self.anc_boxes.to(self.device), ground_truth[i]).unsqueeze(-1)
             else:
-                ious_anc_gt = torch.cat([ious_anc_gt, calculate_ious(self.anc_boxes, ground_truth[i]).unsqueeze(-1)], dim=-1)
+                # ious_anc_gt = torch.cat([ious_anc_gt, calculate_ious(self.anc_boxes, ground_truth[i]).unsqueeze(-1)], dim=-1)
+                ious_anc_gt = torch.cat([ious_anc_gt, calculate_ious(self.anc_boxes.to(self.device), ground_truth[i]).unsqueeze(-1)], dim=-1)
 
         # t_e = time.time()
         # print(f'rpn._calculate_ious_anchor_ground_truth() end : {t_e - t_s:.3f}')
 
         return ious_anc_gt
 
-    def test(self, ground_truth):
-        self._sample_anchor_box(ground_truth)
-
-
     def _sample_anchor_box(self, ground_truth):
-        device = ground_truth.device
-
-        # t_s = time.time()
-        # print(f'rpn._sample_anchor_box() start')
 
         ious_anc_gt = self._calculate_ious_anchor_ground_truth(ground_truth)
-        val_max_iou_anc_gt = torch.max(ious_anc_gt, dim=0).values
-        idx_max_iou_anc_gt = torch.max(ious_anc_gt, dim=0).indices
-
-        pos_iou_idx = (ious_anc_gt > .5)
+        pos_iou_idx = ious_anc_gt > .5
         for i in range(len(ground_truth)):
-            pos_iou_idx[idx_max_iou_anc_gt[i], i] = 1
+            if torch.sum(pos_iou_idx[..., i]) == 0:
+                max_idx = torch.where(ious_anc_gt[..., i] == torch.max(ious_anc_gt[..., i]))[0]
+                pos_iou_idx[max_idx] = False
+                pos_iou_idx[max_idx, i] = True
 
-        pos_anc = torch.cat([*[self.anc_boxes[(pos_iou_idx[..., i] == 1)] for i in range(len(ground_truth))]], dim=0)
-        neg_anc = torch.cat([*[self.anc_boxes[(pos_iou_idx[..., i] == 0)] for i in range(len(ground_truth))]], dim=0)
-        anc_gt_match = torch.cat(
-            [*[torch.Tensor([i for _ in range(pos_iou_idx[..., i].sum())]) for i in range(len(ground_truth))]], dim=0)
+        error_idx = torch.where(torch.sum(pos_iou_idx, dim=-1) > 1)[0]
+        if len(error_idx) > 0:
+            _, max_idx = torch.max(ious_anc_gt[error_idx], -1)
+            pos_iou_idx_error = torch.zeros(pos_iou_idx[error_idx].shape).type(torch.bool).to(self.device)
+            idx1 = torch.linspace(0, len(max_idx) - 1, len(max_idx)).type(torch.long)
+            idx = (idx1, max_idx)
+            pos_iou_idx_error[idx] = True
+            pos_iou_idx[error_idx] = pos_iou_idx_error
 
-        # N_neg_anc = 256 - len(pos_anc)
-        # neg_anc_idx = torch.randperm(len(neg_anc))[:N_neg_anc].to(device)
-        # neg_anc = neg_anc[neg_anc_idx]
+        pos_iou_idx_global = torch.sum(pos_iou_idx, dim=-1).type(torch.bool)
 
-        pos_anc_idx = torch.cat([*[torch.where(pos_iou_idx[..., i] == 1)[0] for i in range(len(ground_truth))]], dim=0)
-        neg_anc_idx = torch.cat([*[torch.where(pos_iou_idx[..., i] == 0)[0] for i in range(len(ground_truth))]], dim=0)
-        anc_idx = torch.cat([pos_anc_idx, neg_anc_idx], dim=0)
+        pos_anc_idx = torch.where(pos_iou_idx_global == True)
+        neg_anc_idx = torch.where(pos_iou_idx_global == False)
+        N_pos = len(pos_anc_idx[0])
+        N_neg = len(neg_anc_idx[0])
+        neg_idx_range = torch.randperm(N_neg)[:256-N_pos]
+        anc_idx = torch.cat([pos_anc_idx[0], neg_anc_idx[0][neg_idx_range]])
+        anc_cls_label = torch.cat([torch.ones(N_pos), torch.zeros(256-N_pos)])
 
-        anc_box = torch.cat([pos_anc, neg_anc], dim=0)
-        anc_label = torch.cat([torch.ones(len(pos_anc)), torch.zeros(len(neg_anc))], dim=0)
-        anc_gt_match = torch.cat([anc_gt_match, torch.zeros(len(neg_anc))], dim=0)
-        gt_per_anc = ground_truth[anc_gt_match.long()]
+        gt_per_anc_idx = torch.where(pos_iou_idx[pos_anc_idx[0]] == 1)[-1]
 
-        anc_box = convert_box_from_yxyx_to_yxhw(anc_box)
+        anc_cls_label = anc_cls_label.to(self.device)
+        gt_per_anc_idx = gt_per_anc_idx.to(self.device)
 
-        anc_box = anc_box.cuda()
-        anc_label = anc_label.cuda()
-        gt_per_anc = gt_per_anc.cuda()
-        anc_idx = anc_idx.cuda()
+        return anc_idx, anc_cls_label, gt_per_anc_idx
 
-        # Normalize anchor box coordinates
-        anc_box /= 28
-
-        # t_e = time.time()
-        # print(f'rpn._sample_anchor_box() end : {t_e - t_s:.3f}')
-
-        return anc_box, anc_label, gt_per_anc, anc_idx
-
-    def forward(self, x, ground_truth=None):
-        # ground truth는 (28, 28) feature size에 맞게 yxyx로 조정되어져 있음
-
-        # t_s = time.time()
-        # print('rpn.forward() start')
-
-        _, _, _, x = self.backbone(x)
-
-        x = self.conv(x)
-        reg = self.conv_reg(x)
-        cls = self.conv_cls(x)
-
-        reg = reg.reshape(reg.shape[0], 4, -1).permute(0, 2, 1)
-        cls = cls.reshape(cls.shape[0], -1)
-
-        if ground_truth is not None:
-            anc_box, anc_label, gt_per_anc, anc_idx = self._sample_anchor_box(ground_truth)
-            reg = reg[0, anc_idx]
-            cls = cls[0, anc_idx]
-
-            return reg, cls, anc_box, anc_label, gt_per_anc
-
-        else:
-            return reg, cls
-
-
-class BoxRegModule(nn.Module):
-    def __init__(self):
-        super(BoxRegModule, self).__init__()
-
-    def forward(self, box, anchor_box):
-        # t_s = time.time()
-        # print(f'BoxRegModule() start')
-
+    def _parametrize_box(self, box, anchor_box):
         cy, cx, h, w = box[..., 0], box[..., 1], box[..., 2], box[..., 3]
         cy_anc, cx_anc, h_anc, w_anc = anchor_box[..., 0], anchor_box[..., 1], anchor_box[..., 2], anchor_box[..., 3]
 
@@ -216,6 +167,46 @@ class BoxRegModule(nn.Module):
 
         return torch.cat([cy_t, cx_t, h_t, w_t], dim=-1)
 
+    def forward(self, x, gt=None):
+        # ground truth는 (28, 28) feature size에 맞게 yxyx로 조정되어져 있음
+        # reg layer의 roi들은 (28, 28) feature size에 대해 normalize 되어져 있음 (0~1)
+
+        # t_s = time.time()
+        # print('rpn.forward() start')
+
+        if self.train_rpn_only:
+            _, _, _, x = self.backbone(x)
+
+        x = self.conv(x)
+        reg = self.conv_reg(x)
+        cls = self.conv_cls(x)
+
+        reg = reg.view(reg.shape[0], 4, -1).permute(0, 2, 1).squeeze()[self.valid_idx]
+        cls = cls.view(cls.shape[0], -1).squeeze()[self.valid_idx]
+
+        if gt is not None:
+            anc_idx, gt_cls, gt_per_anc_idx = self._sample_anchor_box(gt)
+            rois = reg[anc_idx][gt_cls == 1]
+            reg = self._parametrize_box(rois, self.anc_boxes[anc_idx][gt_cls == 1].to(self.device)).type(torch.float64)
+            cls = cls[anc_idx]
+
+            gt = convert_box_from_yxyx_to_yxhw(gt[gt_per_anc_idx])
+            gt_reg = self._parametrize_box(gt, self.anc_boxes[anc_idx][gt_cls == 1].to(self.device))
+
+            loss = rpn_loss(reg, cls, gt_reg, gt_cls)
+
+            anc_box = self.anc_boxes[anc_idx][gt_cls == 1]
+
+            return rois, loss, anc_box, gt_per_anc_idx
+        else:
+            reg = reg[0]
+            cls = cls[0]
+
+            cls_mask = cls > self.roi_cls_threshold
+            reg = reg[cls_mask].view(-1, 4)
+
+            return reg
+
 
 if __name__ == '__main__':
     import cv2 as cv
@@ -223,18 +214,52 @@ if __name__ == '__main__':
     import matplotlib.pyplot as plt
     from PIL import Image
 
-    img = Image.open('../sample/FudanPed00007.png')
-    img = transforms.Compose([transforms.Resize((448, 448)), transforms.ToTensor()])(img).unsqueeze(0).cuda()
+    from torchsummary import summary
+    model = RPN().cuda()
+    model.train_rpn_only = True
+    img = np.zeros((448, 448, 3))
 
-    gt = torch.Tensor([[69, 112, 346, 218], [76, 378, 377, 529], [108, 317, 192, 347]]).cuda()
-    size = (381, 539)
-    in_size = 448
-    feat_size = 28
+    scale = [64, 128, 256]
+    ratio = [.5, 1, 2]
 
-    gt_feat = gt / in_size * feat_size
+    anc = np.zeros((len(scale) * len(ratio), 2))
+    i = 0
+    for s in scale:
+        for r in ratio:
+            h = s / np.sqrt(r)
+            w = s * np.sqrt(r)
+            anc[i] = [h, w]
+            i += 1
 
-    rpn = RPN(256, feat_size).cuda()
-    rpn.test(gt_feat)
+    anc = np.array(anc / 2, dtype=np.int64)
+    print(anc)
+    cx, cy = 224, 224
+    for i in range(len(anc)):
+        pt1 = (int(cx - anc[i, 1]), int(cy - anc[i, 0]))
+        pt2 = (int(cx + anc[i, 1]), int(cy + anc[i, 0]))
+        img = cv.rectangle(img.copy(), pt1, pt2, (0, 255, 0), thickness=3)
+    cv.circle(img, (cx, cy), 3, (255, 0, 0), -1)
+
+    plt.imshow(img)
+    plt.show()
+
+    # img = Image.open('../sample/FudanPed00007.png')
+    # img = transforms.Compose([transforms.Resize((448, 448)), transforms.ToTensor()])(img).unsqueeze(0).cuda()
+    #
+    # gt = torch.Tensor([[69, 112, 346, 218], [76, 378, 377, 529], [108, 317, 192, 347]]).cuda()
+    # size = (381, 539)
+    # in_size = 448
+    # feat_size = 28
+    #
+    # gt[..., 0] /= size[0]
+    # gt[..., 1] /= size[1]
+    # gt[..., 2] /= size[0]
+    # gt[..., 3] /= size[1]
+    #
+    # rpn = RPN().cuda()
+    # rpn.train_rpn_only = True
+    # reg, cls, anc_box, anc_label, gt_per_anc, gt_idx_per_anc = rpn(img, gt)
+    # print(gt_idx_per_anc)
 
 
     # For visualization

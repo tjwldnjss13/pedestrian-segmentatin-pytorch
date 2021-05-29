@@ -279,7 +279,8 @@ def rotate2d_augmentation(image, bounding_box=None, mask=None):
     if len(additional) == 0:
         return img_rotate
     else:
-        return img_rotate, additional
+        additional.insert(0, img_rotate)
+        return additional
 
 
 def horizontal_flip(image, bounding_box):
@@ -325,8 +326,8 @@ def horizontal_flip_augmentation(image, bounding_box=None, mask=None):
     if len(additional) == 0:
         return img_flip
     else:
-        return img_flip, additional
-
+        additional.insert(0, img_flip)
+        return additional
 
 
 def shift_with_mask(image, mask):
@@ -342,6 +343,10 @@ def shift_augmentation(image, bounding_box=None, mask=None):
     additional = []
 
     dist_y, dist_x = [np.random.randint(-10, 10) for _ in range(2)]
+    if torch.sum(bounding_box[..., 0] + dist_y < 0) + torch.sum(image.shape[-2] < bounding_box[..., 2] + dist_y) > 0:
+        dist_y = 0
+    if torch.sum(bounding_box[..., 1] + dist_x < 0) + torch.sum(image.shape[-2] < bounding_box[..., 3] + dist_x) > 0:
+        dist_x = 0
 
     img_shift = torch.roll(image, shifts=(dist_y, dist_x), dims=(1, 2))
     if bounding_box is not None:
@@ -358,7 +363,8 @@ def shift_augmentation(image, bounding_box=None, mask=None):
     if len(additional) == 0:
         return image
     else:
-        return img_shift, additional
+        additional.insert(0, img_shift)
+        return additional
 
 
 def rotate_test():
@@ -432,7 +438,7 @@ def shift_test():
     transform_mask = transforms.Compose([transforms.Resize(img_size, interpolation=Image.NEAREST),
                                          transforms.ToTensor()])
     dset = PennFudanDataset(root, transform_img, transform_mask)
-    img, mask, ann = dset[0]
+    img, mask, mask_inst, ann = dset[0]
     bbox = ann['bounding_boxes']
     h = ann['height']
     w = ann['width']
@@ -441,8 +447,11 @@ def shift_test():
     bbox[..., 2] *= 448. / h
     bbox[..., 3] *= 448. / w
 
-    img_shift, [bbox_shift, mask_shift] = shift_augmentation(img, bbox, mask)
+    img_shift, bbox_shift, mask_shift = shift_augmentation(img, bbox, mask)
     img_shift = img_shift.permute(1, 2, 0).numpy()
+
+    # bbox_shift *= 448 / 28
+    print(bbox_shift)
 
     for box in bbox_shift:
         img_shift = cv.rectangle(img_shift.copy(), (box[1], box[0]), (box[3], box[2]), (0, 255, 0), 3)

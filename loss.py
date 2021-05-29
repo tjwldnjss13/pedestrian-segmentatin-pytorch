@@ -2,63 +2,96 @@ import torch
 import torch.nn as nn
 
 from model.rpn import *
+from dataset.panet_target import *
 
 
-class RPNLoss(nn.Module):
-    def __init__(self, N_cls, N_reg, lambda_reg):
-        super(RPNLoss, self).__init__()
-        self.N_cls = N_cls
-        self.N_reg = N_reg
-        self.lambda_reg = lambda_reg
-        self.box_reg_mod = BoxRegModule()
+def test_cross_entropy_loss(predict_box, target_box):
+    loss_box = -(target_box * torch.log2(predict_box + 1e-9) + (1 - target_box) * torch.log2(1 - predict_box + 1e-9)) / len(predict_box)
+    # loss_mask = -(target_mask * torch.log2(predict_mask + 1e-9) + (1 - target_mask) * torch.log2(1 - predict_mask + 1e-9)) / len(predict_mask)
+    # loss = loss_box.sum() + loss_mask.sum()
 
-    def cross_entropy_loss(self, predict, target):
-        loss_temp = -(target * torch.log2(predict + 1e-9) + (1 - target) * torch.log2(1 - predict + 1e-9))
+    return loss_box.mean(), torch.Tensor([1]).cuda(), torch.Tensor([1]).cuda(), torch.Tensor([1]).cuda()
 
-        return loss_temp.sum()
 
-    def smooth_l1_loss(self, predict, target):
+def rpn_loss(predict_reg, predict_cls, target_reg, target_cls):
+    N_cls = 1
+    N_reg = 28 ** 2
+    lambda_reg = 1
+
+    def smooth_l1_loss(predict, target):
         n = torch.abs(predict - target)
         cond = n < 1
         losses = torch.where(cond, .5 * n ** 2, n - .5)
 
-        return losses
+        return losses.mean()
 
-    def custom_reg_loss(self, predict_reg, target_reg):
-        loss_temp = self.smooth_l1_loss(predict_reg, target_reg)
+    loss_cls = F.binary_cross_entropy(predict_cls, target_cls) / N_cls
+    loss_reg = lambda_reg * smooth_l1_loss(predict_reg, target_reg) / N_reg
 
-        return loss_temp.sum()
+    loss = loss_cls + loss_reg
 
-    def forward(self, predict_reg, predict_cls, anchor_box, anchor_label, ground_truth_per_anchor_box):
-        pred_reg = predict_reg
-        pred_cls = predict_cls
-        anc_box = anchor_box
-        anc_label = anchor_label
-        gt_per_anc = ground_truth_per_anchor_box
+    return loss
 
-        gt_per_anc /= 28
 
-        # print('pred_reg : ', pred_reg)
-        # print('gt_per_anc : ', gt_per_anc)
+def panet_loss(predict_box, predict_mask, target_box, target_mask):
+    loss_box = F.binary_cross_entropy(predict_box, target_box)
+    loss_mask = F.binary_cross_entropy(predict_mask, target_mask)
 
-        self.N_cls = pred_cls.shape[0]
+    return loss_box, loss_mask
 
-        pred_reg = self.box_reg_mod(pred_reg, anc_box)
-        gt_reg = self.box_reg_mod(gt_per_anc, anc_box)
 
-        # print('pred_reg : ', pred_reg)
-        # print('gt_reg : ', gt_reg)
+class PANetLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
 
-        N_pos = anc_label.sum().int()
-        pos_pred_reg = pred_reg[:N_pos]
-        pos_gt_reg = gt_reg[:N_pos]
+    def cross_entropy_loss(self, predict, target):
+        loss = -(target * torch.log2(predict + 1e-9) + (1 - target) * torch.log2(1 - predict + 1e-9))
 
-        loss_cls = self.cross_entropy_loss(pred_cls, anc_label) / self.N_cls
-        loss_reg = self.lambda_reg * self.custom_reg_loss(pos_pred_reg, pos_gt_reg) / self.N_reg
+        return loss.mean()
 
-        loss = loss_cls + loss_reg
+    def forward(self, predict_box, predict_mask, predict_reg_rpn, predict_cls_rpn,
+                ground_truth_box, ground_truth_mask, anchor_box, anchor_label, ground_truth_per_anchor_idx):
+        print('panet loss start')
 
-        return loss
+        # for i in range(len(predict_box)):
+        #     print(predict_box[i].detach().cpu().numpy(), target_box[i].detach().cpu().numpy())
+
+        tar_box, tar_mask = generate_panet_target(ground_truth_box, ground_truth_mask, ground_truth_per_anchor_idx)
+        loss_box = self.cross_entropy_loss(predict_box, tar_box)
+        loss_mask = self.cross_entropy_loss(predict_mask, tar_mask)
+
+        loss = loss_box + loss_mask
+
+        print('panet loss end')
+
+        return loss, loss_rpn, loss_box, loss_mask
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
